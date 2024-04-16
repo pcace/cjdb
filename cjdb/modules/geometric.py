@@ -8,6 +8,7 @@ from pyproj import CRS, Transformer
 from shapely import force_2d
 from shapely.geometry import MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
+import pyclipper
 
 from cjdb.logger import logger
 from cjdb.modules.exceptions import InvalidLodException
@@ -45,9 +46,7 @@ def reproject_vertex_list(vertices, srid_from, srid_to):
     target_proj = CRS.from_epsg(srid_to)
 
     # prepare transformer from crs to crs
-    transformer = Transformer.from_crs(source_proj,
-                                       target_proj,
-                                       always_xy=True)
+    transformer = Transformer.from_crs(source_proj, target_proj, always_xy=True)
 
     # transform all the coordinates
     reprojected_xyz = transformer.transform(*zip(*vertices))
@@ -81,10 +80,7 @@ def resolve(lod_level, vertices, inplace=True):
     return resolvable
 
 
-def resolve_template(lod_level,
-                     vertices,
-                     geometry_templates,
-                     source_target_srid):
+def resolve_template(lod_level, vertices, geometry_templates, source_target_srid):
     # get anchor point
     vertex_id = lod_level["boundaries"][0]
     anchor = vertices[vertex_id]
@@ -167,9 +163,7 @@ def get_flattened_polygons_from_boundaries(
         return polygons
     else:
         for shell in boundaries:
-            polygons = get_flattened_polygons_from_boundaries(
-                shell,
-                polygons=polygons)
+            polygons = get_flattened_polygons_from_boundaries(shell, polygons=polygons)
         return polygons
 
 
@@ -183,46 +177,59 @@ def is_surface_vertical(normal: np.ndarray) -> bool:
     by calculating their dot product. If the dot product is
     close to 0 then the vectors are perpendicular.
     """
-    dot_prd = 0 * normal[0] \
-        + 0 * normal[1] \
-        + 1 * normal[2]
+    dot_prd = 0 * normal[0] + 0 * normal[1] + 1 * normal[2]
 
-    if abs(dot_prd) < 0.1:
+    if abs(dot_prd) < 0.6:
         return True
     else:
         return False
 
 
 def get_ground_surfaces(polygons: List[Polygon]) -> List[Polygon]:
-    ground_surfaces = {}
+
+    clipper = pyclipper.Pyclipper()
+    toBeClipped = []
+    solution = []
+
     for polygon in polygons:
-        xyz = np.asarray(polygon.exterior.coords)[0:-1]
-        normal, is_coplanar = get_normal_newell(xyz)
-        if is_surface_vertical(normal):
-            continue
+        polygon_2d = [(x, y) for x, y, z in polygon.exterior.coords]
+
+        # Ensure the polygon is closed
+        if polygon_2d[0] != polygon_2d[-1]:
+            polygon_2d.append(polygon_2d[0])
+
+        area = pyclipper.Area(polygon_2d)
+
+        # Only add the polygon to the clipper if it has at least 3 points,
+        # has an area (remove vertical polygons), and is CCW
+        if len(polygon_2d) >= 3 and abs(area) > 0 and pyclipper.Orientation(polygon_2d):
+            toBeClipped.append(list(reversed(polygon_2d)))
+
+    if len(toBeClipped) > 0:
+        for path in toBeClipped:
+            clipper.AddPath(list(reversed(path)), pyclipper.PT_SUBJECT, True)
+        solution = clipper.Execute(pyclipper.CT_UNION)
+    return [Polygon(polygon) for polygon in solution]
+
+def merge_into_a_multipolygon(
+    ground_surfaces: List[Union[Polygon, MultiPolygon]]
+) -> MultiPolygon:
+    valid_ground_surfaces = []
+    for gs in ground_surfaces:
+        if not gs.is_valid:
+            gs = gs.buffer(0)
+        if gs.is_valid:
+            valid_ground_surfaces.append(gs)
         else:
-            z = mean([point[2] for point in polygon.exterior.coords])
-            ground_surfaces[z] = force_2d(polygon)
-    if len(ground_surfaces) == 0:
-        raise Exception(polygons)
-    z_mean = mean(ground_surfaces.keys())
-    return [v for k, v in ground_surfaces.items() if k < z_mean]
-
-
-def merge_into_a_multipolygon(ground_surfaces:
-                              List[Union[Polygon, MultiPolygon]]
-                              ) -> MultiPolygon:
-    polygon = unary_union(force_2d(ground_surfaces))
+            print(f"Invalid geometry at {gs.wkt}")
+    polygon = unary_union(force_2d(valid_ground_surfaces))
     if isinstance(polygon, MultiPolygon):
         return polygon
     else:
         return MultiPolygon([polygon])
 
-
-def get_ground_geometry(
-    geometries: List[Dict[str, Any]], obj_id: str
-) -> MultiPolygon:
-    """ Receives a list of transformed boundary coordinates
+def get_ground_geometry(geometries: List[Dict[str, Any]], obj_id: str) -> MultiPolygon:
+    """Receives a list of transformed boundary coordinates
     of the city object
     and extracts only the ground surface.
     If there is an LoD 0, then all the available surfaces
@@ -236,8 +243,7 @@ def get_ground_geometry(
         logger.warning(f"No geometry for object ID=({obj_id}) ")
         return None
 
-    if geometry["type"] == "MultiPoint" or\
-       geometry["type"] == "MultiLineString":
+    if geometry["type"] == "MultiPoint" or geometry["type"] == "MultiLineString":
         logger.warning(
             f"""MultiPoint or MultiLineString type has no ground geometry,
             object ID=({obj_id})"""
@@ -253,7 +259,6 @@ def get_ground_geometry(
     else:
         # TODO: check if there are surface types available
         # to choose the ground surfaces
-        surfaces = get_flattened_polygons_from_boundaries(
-            geometry["boundaries"])
+        surfaces = get_flattened_polygons_from_boundaries(geometry["boundaries"])
         ground_surfaces = get_ground_surfaces(surfaces)
         return merge_into_a_multipolygon(ground_surfaces)
